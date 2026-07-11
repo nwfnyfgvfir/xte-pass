@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Apply source-level log silence + branding strip to an upstream core tree.
 # Usage: patch-nolog.sh <core-src-dir>
+# Robust against minor whitespace differences across tags.
 set -euo pipefail
 
 ROOT="${1:?core source root required}"
@@ -33,6 +34,7 @@ import pathlib
 import re
 import sys
 
+paths = list(map(pathlib.Path, sys.argv[1:]))
 (
     log_go,
     logger_go,
@@ -44,13 +46,49 @@ import sys
     env_go,
     help_go,
     cmd_go,
-) = map(pathlib.Path, sys.argv[1:])
+) = paths
 
 
-def must_sub(pattern: str, repl: str, text: str, path: pathlib.Path, flags=0, count=1) -> str:
-    new, n = re.subn(pattern, repl, text, count=count, flags=flags)
+def replace_func(text: str, sig_re: str, new_func: str, path: pathlib.Path) -> str:
+    """Replace a top-level Go function whose signature matches sig_re (full line).
+
+    Uses brace matching so internal whitespace/newlines do not matter.
+    """
+    m = re.search(sig_re, text, flags=re.M)
+    if not m:
+        raise SystemExit(f"signature not found in {path}: {sig_re}")
+    start = m.start()
+    # find opening brace of function body
+    brace = text.find("{", m.end() - 1)
+    if brace < 0:
+        raise SystemExit(f"opening brace not found for {sig_re} in {path}")
+    depth = 0
+    i = brace
+    while i < len(text):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                # swallow trailing newline
+                if end < len(text) and text[end] == "\n":
+                    end += 1
+                return text[:start] + new_func.rstrip() + "\n" + text[end:]
+        i += 1
+    raise SystemExit(f"unbalanced braces for {sig_re} in {path}")
+
+
+def replace_const_string(text: str, name: str, new_value: str = "") -> str:
+    """Replace `name = "...."` assignments (single line). Idempotent."""
+    # already patched to empty string
+    if re.search(rf'^\s*{re.escape(name)}\s*=\s*""', text, flags=re.M):
+        return text
+    pat = rf'^(\s*{re.escape(name)}\s*=\s*)"[^"]*"([^\n]*)'
+    new, n = re.subn(pat, rf'\1"{new_value}" // nolog-patch', text, count=1, flags=re.M)
     if n == 0:
-        raise SystemExit(f"pattern not found in {path}: {pattern[:80]!r}")
+        raise SystemExit(f"assignment not found: {name}")
     return new
 
 
@@ -58,15 +96,18 @@ def must_sub(pattern: str, repl: str, text: str, path: pathlib.Path, flags=0, co
 s = log_go.read_text()
 if "func Record(msg Message)" not in s:
     raise SystemExit("Record not found — upstream API changed")
-s = must_sub(
-    r"func Record\(msg Message\) \{\n\tlogHandler\.Handle\(msg\)\n\}",
-    "func Record(msg Message) {\n\t// nolog-patch: swallow all log records\n}",
-    s,
-    log_go,
-)
-s = must_sub(
-    r"func RegisterHandler\(handler Handler\) \{\n\tif handler == nil \{\n\t\tpanic\(\"Log handler is nil\"\)\n\t\}\n\tlogHandler\.Set\(handler\)\n\}",
-    """func RegisterHandler(handler Handler) {
+if "nolog-patch: swallow all log records" not in s:
+    s = replace_func(
+        s,
+        r"^func Record\(msg Message\)\s*\{",
+        "func Record(msg Message) {\n\t// nolog-patch: swallow all log records\n}\n",
+        log_go,
+    )
+if "nologNoopHandler" not in s:
+    s = replace_func(
+        s,
+        r"^func RegisterHandler\(handler Handler\)\s*\{",
+        """func RegisterHandler(handler Handler) {
 \t// nolog-patch: always install no-op; ignore caller-provided handler
 \tlogHandler.Set(nologNoopHandler{})
 }
@@ -75,116 +116,129 @@ type nologNoopHandler struct{}
 
 func (nologNoopHandler) Handle(msg Message) {}
 """,
-    s,
-    log_go,
-)
+        log_go,
+    )
 log_go.write_text(s)
 
 # --- common/log/logger.go ---
 s = logger_go.read_text()
-s = must_sub(
-    r"func \(l \*serverityLogger\) Handle\(msg Message\) \{\n\tswitch msg := msg\.\(type\) \{\n\tcase \*GeneralMessage:\n\t\tif msg\.Severity <= l\.logLevel \{\n\t\t\tl\.inner\.Handle\(msg\)\n\t\t\}\n\tdefault:\n\t\tl\.inner\.Handle\(msg\)\n\t\}\n\}",
-    "func (l *serverityLogger) Handle(msg Message) {\n\t// nolog-patch\n}",
+s = replace_func(
     s,
+    r"^func \(l \*serverityLogger\) Handle\(msg Message\)\s*\{",
+    "func (l *serverityLogger) Handle(msg Message) {\n\t// nolog-patch\n}\n",
     logger_go,
 )
-s = must_sub(
-    r"func \(l \*generalLogger\) Handle\(msg Message\) \{\n\tselect \{\n\tcase l\.buffer <- msg:\n\tdefault:\n\t\}\n\n\tselect \{\n\tcase <-l\.access\.Wait\(\):\n\t\tgo l\.run\(\)\n\tdefault:\n\t\}\n\}",
-    "func (l *generalLogger) Handle(msg Message) {\n\t// nolog-patch\n}",
+s = replace_func(
     s,
+    r"^func \(l \*generalLogger\) Handle\(msg Message\)\s*\{",
+    "func (l *generalLogger) Handle(msg Message) {\n\t// nolog-patch\n}\n",
     logger_go,
 )
-s = must_sub(
-    r"func CreateStdoutLogWriter\(\) WriterCreator \{\n\treturn func\(\) Writer \{\n\t\treturn &consoleLogWriter\{\n\t\t\tlogger: log\.New\(os\.Stdout, \"\", log\.Ldate\|log\.Ltime\|log\.Lmicroseconds\),\n\t\t\}\n\t\}\n\}",
-    "func CreateStdoutLogWriter() WriterCreator {\n\t// nolog-patch\n\treturn func() Writer { return nil }\n}",
+s = replace_func(
     s,
+    r"^func CreateStdoutLogWriter\(\) WriterCreator\s*\{",
+    "func CreateStdoutLogWriter() WriterCreator {\n\t// nolog-patch\n\treturn func() Writer { return nil }\n}\n",
     logger_go,
 )
-s = must_sub(
-    r"func CreateStderrLogWriter\(\) WriterCreator \{\n\treturn func\(\) Writer \{\n\t\treturn &consoleLogWriter\{\n\t\t\tlogger: log\.New\(os\.Stderr, \"\", log\.Ldate\|log\.Ltime\|log\.Lmicroseconds\),\n\t\t\}\n\t\}\n\}",
-    "func CreateStderrLogWriter() WriterCreator {\n\t// nolog-patch\n\treturn func() Writer { return nil }\n}",
+s = replace_func(
     s,
+    r"^func CreateStderrLogWriter\(\) WriterCreator\s*\{",
+    "func CreateStderrLogWriter() WriterCreator {\n\t// nolog-patch\n\treturn func() Writer { return nil }\n}\n",
     logger_go,
 )
-s = must_sub(
-    r"func init\(\) \{\n\tRegisterHandler\(NewLogger\(CreateStdoutLogWriter\(\)\)\)\n\}",
-    "func init() {\n\t// nolog-patch\n\tRegisterHandler(nologNoopHandler{})\n}",
+s = replace_func(
     s,
+    r"^func init\(\)\s*\{",
+    "func init() {\n\t// nolog-patch\n\tRegisterHandler(nologNoopHandler{})\n}\n",
     logger_go,
 )
 logger_go.write_text(s)
 
 # --- app/log/log.go ---
 s = app_log.read_text()
-s = must_sub(
-    r"func \(g \*Instance\) Handle\(msg log\.Message\) \{\n\tg\.RLock\(\)\n\tdefer g\.RUnlock\(\)\n\n\tif !g\.active \{\n\t\treturn\n\t\}\n\n\tvar Msg log\.Message\n\tif g\.config\.MaskAddress != \"\" \{\n\t\tMsg = &MaskedMsgWrapper\{\n\t\t\tMessage: msg,\n\t\t\tMask4:   g\.mask4,\n\t\t\tMask6:   g\.mask6,\n\t\t\}\n\t\} else \{\n\t\tMsg = msg\n\t\}\n\n\tswitch msg := msg\.\(type\) \{\n\tcase \*log\.AccessMessage:\n\t\tif g\.accessLogger != nil \{\n\t\t\tg\.accessLogger\.Handle\(Msg\)\n\t\t\}\n\tcase \*log\.DNSLog:\n\t\tif g\.dns && g\.accessLogger != nil \{\n\t\t\tg\.accessLogger\.Handle\(Msg\)\n\t\t\}\n\tcase \*log\.GeneralMessage:\n\t\tif g\.errorLogger != nil && msg\.Severity <= g\.config\.ErrorLogLevel \{\n\t\t\tg\.errorLogger\.Handle\(Msg\)\n\t\t\}\n\tdefault:\n\t\t// Swallow\n\t\}\n\}",
-    "func (g *Instance) Handle(msg log.Message) {\n\t// nolog-patch: discard access/error/dns logs\n}",
+s = replace_func(
     s,
+    r"^func \(g \*Instance\) Handle\(msg log\.Message\)\s*\{",
+    "func (g *Instance) Handle(msg log.Message) {\n\t// nolog-patch: discard access/error/dns logs\n}\n",
     app_log,
 )
 app_log.write_text(s)
 
 # --- core/core.go ---
 s = core_go.read_text()
-s = must_sub(
-    r'codename = "Xray, Penetrates Everything\."\n\tintro    = "A unified platform for anti-censorship\."',
-    'codename = "" // nolog-patch\n\tintro    = "" // nolog-patch',
+s = replace_const_string(s, "codename", "")
+s = replace_const_string(s, "intro", "")
+s = replace_func(
     s,
+    r"^func VersionStatement\(\) \[\]string\s*\{",
+    """func VersionStatement() []string {
+\t// nolog-patch: pure version only
+\t_, _, _ = codename, intro, build
+\treturn []string{Version()}
+}
+""",
     core_go,
-)
-# Replace entire VersionStatement body (spacing-tolerant)
-s = must_sub(
-    r"func VersionStatement\(\) \[\]string \{.*?\n\}",
-    "func VersionStatement() []string {\n\t// nolog-patch: pure version only\n\t_, _, _ = codename, intro, build\n\treturn []string{Version()}\n}",
-    s,
-    core_go,
-    flags=re.S,
 )
 # Drop imports only used by old VersionStatement
 if "serial." not in s:
     s = s.replace('\n\t"github.com/xtls/xray-core/common/serial"\n', "\n")
+    s = s.replace('\r\n\t"github.com/xtls/xray-core/common/serial"\r\n', "\r\n")
 if "runtime." not in s:
-    s = s.replace('\n\t"runtime"\n', "\n")
+    s = re.sub(r'\n\t"runtime"\n', "\n", s)
 core_go.write_text(s)
 
 # --- main/version.go ---
 s = version_go.read_text()
-s = must_sub(
-    r'var cmdVersion = &base\.Command\{\n\tUsageLine: "\{\{\.Exec\}\} version",\n\tShort:     "Show current version of Xray",\n\tLong: `Version prints the build information for Xray executables\.\n\t`,\n\tRun: executeVersion,\n\}',
-    '''var cmdVersion = &base.Command{
-\tUsageLine: "{{.Exec}} version",
-\tShort:     "Show current version",
-\tLong:      `Show current version.`,
-\tRun:       executeVersion,
-}''',
+s = s.replace("Show current version of Xray", "Show current version")
+s = re.sub(
+    r"Long:\s*`Version prints the build information for Xray executables\.\s*`",
+    'Long:      `Show current version.`',
     s,
-    version_go,
+    count=1,
 )
-s = must_sub(
-    r"func printVersion\(\) \{\n\tversion := core\.VersionStatement\(\)\n\tfor _, s := range version \{\n\t\tfmt\.Println\(s\)\n\t\}\n\}",
-    "func printVersion() {\n\t// nolog-patch: pure version only\n\tfmt.Println(core.Version())\n}",
+s = replace_func(
     s,
+    r"^func printVersion\(\)\s*\{",
+    "func printVersion() {\n\t// nolog-patch: pure version only\n\tfmt.Println(core.Version())\n}\n",
     version_go,
 )
 version_go.write_text(s)
 
-# --- main/run.go: do not print version on start; neutralize help text ---
+# --- main/run.go: silent start + soften help strings ---
 s = run_go.read_text()
-s = must_sub(
-    r"\tprintVersion\(\)\n\tserver, err := startXray\(\)",
-    "\t// nolog-patch: silent start\n\tserver, err := startXray()",
-    s,
-    run_go,
-)
-# Soften user-facing Short/Long that contain branding (help text only)
-s = s.replace("Run Xray with config, the default command", "Run with config, the default command")
-s = s.replace("without launching Xray server.", "without launching the server.")
-s = s.replace("Config path for Xray.", "Config path.")
-s = s.replace("before Xray starts.", "before the process starts.")
-s = s.replace("\nXray. Multiple assign is accepted.", "\nMultiple assign is accepted.")
-s = s.replace("set the config files for\nXray.", "set the config files.")
-s = s.replace("tells Xray to test config files only,", "tests config files only,")
-s = s.replace("tells Xray to print the merged config.", "prints the merged config.")
+if "nolog-patch: silent start" not in s:
+    if "printVersion()" not in s:
+        raise SystemExit(f"printVersion() call not found in {run_go}")
+    s = s.replace(
+        "\tprintVersion()\n\tserver, err := startXray()",
+        "\t// nolog-patch: silent start\n\tserver, err := startXray()",
+        1,
+    )
+    if "nolog-patch: silent start" not in s:
+        # whitespace-tolerant
+        s2, n = re.subn(
+            r"[ \t]*printVersion\(\)[ \t]*\n[ \t]*server, err := startXray\(\)",
+            "\t// nolog-patch: silent start\n\tserver, err := startXray()",
+            s,
+            count=1,
+        )
+        if n == 0:
+            raise SystemExit("failed to remove printVersion() from run")
+        s = s2
+# Soften user-facing strings (best-effort; help only)
+for a, b in [
+    ("Run Xray with config, the default command", "Run with config, the default command"),
+    ("without launching Xray server.", "without launching the server."),
+    ("Config path for Xray.", "Config path."),
+    ("before Xray starts.", "before the process starts."),
+    ("\nXray. Multiple assign is accepted.", "\nMultiple assign is accepted."),
+    ("set the config files for\nXray.", "set the config files."),
+    ("tells Xray to test config files only,", "tests config files only,"),
+    ("tells Xray to print the merged config.", "prints the merged config."),
+    ("Dump merged config only, without launching Xray server.", "Dump merged config only, without launching the server."),
+    ("Test config file only, without launching Xray server.", "Test config file only, without launching the server."),
+]:
+    s = s.replace(a, b)
 run_go.write_text(s)
 
 # --- main/main.go ---
@@ -197,12 +251,16 @@ main_go.write_text(s)
 
 # --- main/commands/base/env.go ---
 s = env_go.read_text()
-s = must_sub(
-    r'CommandEnv\.Exec = "xray"',
-    'CommandEnv.Exec = "app" // nolog-patch',
-    s,
-    env_go,
-)
+if 'CommandEnv.Exec = "app"' not in s:
+    s2, n = re.subn(
+        r'CommandEnv\.Exec\s*=\s*"xray"',
+        'CommandEnv.Exec = "app" // nolog-patch',
+        s,
+        count=1,
+    )
+    if n == 0:
+        raise SystemExit("CommandEnv.Exec assignment not found")
+    s = s2
 env_go.write_text(s)
 
 # --- help.go / command.go: replace hardcoded help brand if present ---
@@ -213,8 +271,10 @@ if help_go.exists():
         help_go.write_text(s2)
 if cmd_go.exists():
     s = cmd_go.read_text()
-    s2 = s.replace("Run 'xray help", "Run 'app help").replace("a xray command", "a command").replace(
-        "like xray run or xray version", "like app run or app version"
+    s2 = (
+        s.replace("Run 'xray help", "Run 'app help")
+        .replace("a xray command", "a command")
+        .replace("like xray run or xray version", "like app run or app version")
     )
     if s2 != s:
         cmd_go.write_text(s2)
@@ -236,14 +296,13 @@ grep -q 'CommandEnv.Exec = "app"' "$ENV_GO" || die "Exec rename missing"
 if grep -n 'RegisterHandler(NewLogger(CreateStdoutLogWriter()))' "$LOGGER_GO"; then
   die "stdout logger still registered in init"
 fi
-# Runtime branding only (package comments may still mention upstream names)
 if grep -nE 'serial\.Concat\("Xray |"Xray, Penetrates|"Show current version of Xray' "$CORE_GO" "$VERSION_GO"; then
   die "runtime branding still present in core/version"
 fi
 if grep -n 'codename = "Xray' "$CORE_GO"; then
   die "codename still branded"
 fi
-if ! grep -q 'return \[\]string{Version()}' "$CORE_GO" && ! grep -q 'return []string{Version()}' "$CORE_GO"; then
+if ! grep -Fq 'return []string{Version()}' "$CORE_GO"; then
   die "VersionStatement does not return pure Version()"
 fi
 
