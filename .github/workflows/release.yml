@@ -31,7 +31,7 @@ jobs:
       commid: ${{ steps.clone.outputs.commid }}
     steps:
       - name: Checkout packaging repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve version
         id: ver
@@ -73,7 +73,7 @@ jobs:
 
       - name: Upload patched source
         if: steps.ver.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: patched-core
           path: core-src
@@ -85,7 +85,7 @@ jobs:
 
       - name: Upload geo
         if: steps.ver.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: geo-data
           path: geo
@@ -128,22 +128,22 @@ jobs:
       CGO_ENABLED: "0"
     steps:
       - name: Checkout packaging repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download patched source
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: patched-core
           path: core-src
 
       - name: Download geo
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: geo-data
           path: geo
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: core-src/go.mod
           cache-dependency-path: core-src/go.sum
@@ -179,7 +179,7 @@ jobs:
           ls -lh "dist/app-${{ matrix.asset }}.zip"*
 
       - name: Upload asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: asset-${{ matrix.asset }}
           path: |
@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: asset-*
           merge-multiple: true
@@ -202,7 +202,7 @@ jobs:
         run: ls -lah assets
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.version }}
           name: app ${{ needs.prepare.outputs.version }}
