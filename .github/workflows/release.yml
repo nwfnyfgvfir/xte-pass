@@ -1,0 +1,223 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream tag (e.g. v26.6.27). Empty = latest"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if release already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.version || 'latest' }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: XTLS/Xray-core
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      skip: ${{ steps.ver.outputs.skip }}
+      commid: ${{ steps.clone.outputs.commid }}
+    steps:
+      - name: Checkout packaging repo
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REQ="${{ github.event.inputs.version }}"
+          if [[ -z "$REQ" ]]; then
+            VER="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          else
+            VER="$REQ"
+            gh api "repos/${UPSTREAM_REPO}/git/refs/tags/${VER}" >/dev/null
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VER}"
+
+          SKIP=false
+          if [[ "${{ github.event.inputs.force }}" != "true" ]]; then
+            if gh release view "$VER" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "Release ${VER} already exists — skip"
+              SKIP=true
+            fi
+          fi
+          echo "skip=${SKIP}" >> "$GITHUB_OUTPUT"
+
+      - name: Clone upstream core
+        id: clone
+        if: steps.ver.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.ver.outputs.version }}" \
+            "https://github.com/${UPSTREAM_REPO}.git" core-src
+          echo "commid=$(git -C core-src rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Apply patches
+        if: steps.ver.outputs.skip != 'true'
+        run: bash scripts/patch-nolog.sh "${GITHUB_WORKSPACE}/core-src"
+
+      - name: Upload patched source
+        if: steps.ver.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-core
+          path: core-src
+          retention-days: 1
+
+      - name: Download geo data
+        if: steps.ver.outputs.skip != 'true'
+        run: bash scripts/download-geo.sh "${GITHUB_WORKSPACE}/geo" "${{ steps.ver.outputs.version }}"
+
+      - name: Upload geo
+        if: steps.ver.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: geo-data
+          path: geo
+          retention-days: 1
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            asset: linux-64
+          - goos: linux
+            goarch: arm64
+            asset: linux-arm64-v8a
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            asset: linux-arm32-v7a
+          - goos: windows
+            goarch: amd64
+            asset: windows-64
+          - goos: windows
+            goarch: arm64
+            asset: windows-arm64-v8a
+          - goos: darwin
+            goarch: amd64
+            asset: macos-64
+          - goos: darwin
+            goarch: arm64
+            asset: macos-arm64-v8a
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      GOARM: ${{ matrix.goarm }}
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout packaging repo
+        uses: actions/checkout@v4
+
+      - name: Download patched source
+        uses: actions/download-artifact@v4
+        with:
+          name: patched-core
+          path: core-src
+
+      - name: Download geo
+        uses: actions/download-artifact@v4
+        with:
+          name: geo-data
+          path: geo
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: core-src/go.mod
+          cache-dependency-path: core-src/go.sum
+
+      - name: Build
+        working-directory: core-src
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          COMMID="${{ needs.prepare.outputs.commid }}"
+          if [[ -z "$COMMID" || "$COMMID" == "${{ needs.prepare.outputs.version }}" ]]; then
+            COMMID="$(git rev-parse --short HEAD 2>/dev/null || echo "${{ needs.prepare.outputs.version }}")"
+          fi
+          OUT=app
+          if [[ "${GOOS}" == "windows" ]]; then
+            OUT=app.exe
+          fi
+          go build -o "../dist/${OUT}" -trimpath -buildvcs=false \
+            -gcflags="all=-l=4" \
+            -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID}-nl -s -w -buildid=" \
+            -v ./main
+          ls -lh "../dist/${OUT}"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq zip >/dev/null
+          BIN=dist/app
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            BIN=dist/app.exe
+          fi
+          bash scripts/package.sh "$BIN" geo "${{ matrix.asset }}" core-src/LICENSE dist
+          ls -lh "dist/app-${{ matrix.asset }}.zip"*
+
+      - name: Upload asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.asset }}
+          path: |
+            dist/app-${{ matrix.asset }}.zip
+            dist/app-${{ matrix.asset }}.zip.dgst
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          merge-multiple: true
+          path: assets
+
+      - name: List assets
+        run: ls -lah assets
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: app ${{ needs.prepare.outputs.version }}
+          body: |
+            ## app ${{ needs.prepare.outputs.version }}
+
+            - Silent build of upstream core tag `${{ needs.prepare.outputs.version }}`
+            - Runtime: no business logs; `version` prints pure version only
+            - Binary name: `app` / `app.exe`
+            - Bundle: binary + `geoip.dat` + `geosite.dat`
+            - History: previous releases are kept
+
+            Platforms: linux-64, linux-arm64-v8a, linux-arm32-v7a, windows-64, windows-arm64-v8a, macos-64, macos-arm64-v8a
+          files: assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

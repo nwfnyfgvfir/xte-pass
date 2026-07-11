@@ -1,0 +1,340 @@
+diff -ruN xray-core-probe/app/log/log.go xray-core-test/app/log/log.go
+--- xray-core-probe/app/log/log.go	2026-07-11 20:08:42.510226754 +0800
++++ xray-core-test/app/log/log.go	2026-07-11 20:10:30.442722996 +0800
+@@ -105,40 +105,7 @@
+ 
+ // Handle implements log.Handler.
+ func (g *Instance) Handle(msg log.Message) {
+-	g.RLock()
+-	defer g.RUnlock()
+-
+-	if !g.active {
+-		return
+-	}
+-
+-	var Msg log.Message
+-	if g.config.MaskAddress != "" {
+-		Msg = &MaskedMsgWrapper{
+-			Message: msg,
+-			Mask4:   g.mask4,
+-			Mask6:   g.mask6,
+-		}
+-	} else {
+-		Msg = msg
+-	}
+-
+-	switch msg := msg.(type) {
+-	case *log.AccessMessage:
+-		if g.accessLogger != nil {
+-			g.accessLogger.Handle(Msg)
+-		}
+-	case *log.DNSLog:
+-		if g.dns && g.accessLogger != nil {
+-			g.accessLogger.Handle(Msg)
+-		}
+-	case *log.GeneralMessage:
+-		if g.errorLogger != nil && msg.Severity <= g.config.ErrorLogLevel {
+-			g.errorLogger.Handle(Msg)
+-		}
+-	default:
+-		// Swallow
+-	}
++	// nolog-patch: discard access/error/dns logs
+ }
+ 
+ // Close implements common.Closable.Close().
+diff -ruN xray-core-probe/common/log/log.go xray-core-test/common/log/log.go
+--- xray-core-probe/common/log/log.go	2026-07-11 20:08:42.523226747 +0800
++++ xray-core-test/common/log/log.go	2026-07-11 20:10:30.442722996 +0800
+@@ -29,19 +29,22 @@
+ 
+ // Record writes a message into log stream.
+ func Record(msg Message) {
+-	logHandler.Handle(msg)
++	// nolog-patch: swallow all log records
+ }
+ 
+ var logHandler syncHandler
+ 
+ // RegisterHandler registers a new handler as current log handler. Previous registered handler will be discarded.
+ func RegisterHandler(handler Handler) {
+-	if handler == nil {
+-		panic("Log handler is nil")
+-	}
+-	logHandler.Set(handler)
++	// nolog-patch: always install no-op; ignore caller-provided handler
++	logHandler.Set(nologNoopHandler{})
+ }
+ 
++type nologNoopHandler struct{}
++
++func (nologNoopHandler) Handle(msg Message) {}
++
++
+ type syncHandler struct {
+ 	sync.RWMutex
+ 	Handler
+diff -ruN xray-core-probe/common/log/logger.go xray-core-test/common/log/logger.go
+--- xray-core-probe/common/log/logger.go	2026-07-11 20:08:42.523226747 +0800
++++ xray-core-test/common/log/logger.go	2026-07-11 20:10:30.442722996 +0800
+@@ -58,14 +58,7 @@
+ }
+ 
+ func (l *serverityLogger) Handle(msg Message) {
+-	switch msg := msg.(type) {
+-	case *GeneralMessage:
+-		if msg.Severity <= l.logLevel {
+-			l.inner.Handle(msg)
+-		}
+-	default:
+-		l.inner.Handle(msg)
+-	}
++	// nolog-patch
+ }
+ 
+ func (l *generalLogger) run() {
+@@ -98,16 +91,7 @@
+ }
+ 
+ func (l *generalLogger) Handle(msg Message) {
+-	select {
+-	case l.buffer <- msg:
+-	default:
+-	}
+-
+-	select {
+-	case <-l.access.Wait():
+-		go l.run()
+-	default:
+-	}
++	// nolog-patch
+ }
+ 
+ func (l *generalLogger) Close() error {
+@@ -143,20 +127,14 @@
+ 
+ // CreateStdoutLogWriter returns a LogWriterCreator that creates LogWriter for stdout.
+ func CreateStdoutLogWriter() WriterCreator {
+-	return func() Writer {
+-		return &consoleLogWriter{
+-			logger: log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+-		}
+-	}
++	// nolog-patch
++	return func() Writer { return nil }
+ }
+ 
+ // CreateStderrLogWriter returns a LogWriterCreator that creates LogWriter for stderr.
+ func CreateStderrLogWriter() WriterCreator {
+-	return func() Writer {
+-		return &consoleLogWriter{
+-			logger: log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+-		}
+-	}
++	// nolog-patch
++	return func() Writer { return nil }
+ }
+ 
+ // CreateFileLogWriter returns a LogWriterCreator that creates LogWriter for the given file.
+@@ -179,5 +157,6 @@
+ }
+ 
+ func init() {
+-	RegisterHandler(NewLogger(CreateStdoutLogWriter()))
++	// nolog-patch
++	RegisterHandler(nologNoopHandler{})
+ }
+diff -ruN xray-core-probe/core/core.go xray-core-test/core/core.go
+--- xray-core-probe/core/core.go	2026-07-11 20:08:42.527560078 +0800
++++ xray-core-test/core/core.go	2026-07-11 20:10:30.442722996 +0800
+@@ -11,10 +11,8 @@
+ 
+ import (
+ 	"fmt"
+-	"runtime"
+ 	"runtime/debug"
+ 
+-	"github.com/xtls/xray-core/common/serial"
+ )
+ 
+ var (
+@@ -25,8 +23,8 @@
+ 
+ var (
+ 	build    = "Custom"
+-	codename = "Xray, Penetrates Everything."
+-	intro    = "A unified platform for anti-censorship."
++	codename = "" // nolog-patch
++	intro    = "" // nolog-patch
+ )
+ 
+ func init() {
+@@ -65,8 +63,7 @@
+ 
+ // VersionStatement returns a list of strings representing the full version info.
+ func VersionStatement() []string {
+-	return []string{
+-		serial.Concat("Xray ", Version(), " (", codename, ") ", build, " (", runtime.Version(), " ", runtime.GOOS, "/", runtime.GOARCH, ")"),
+-		intro,
+-	}
++	// nolog-patch: pure version only
++	_, _, _ = codename, intro, build
++	return []string{Version()}
+ }
+diff -ruN xray-core-probe/main/commands/base/command.go xray-core-test/main/commands/base/command.go
+--- xray-core-probe/main/commands/base/command.go	2026-07-11 20:08:42.536226740 +0800
++++ xray-core-test/main/commands/base/command.go	2026-07-11 20:10:30.442722996 +0800
+@@ -14,8 +14,8 @@
+ 	"sync"
+ )
+ 
+-// A Command is an implementation of a xray command
+-// like xray run or xray version.
++// A Command is an implementation of a command
++// like app run or app version.
+ type Command struct {
+ 	// Run runs the command.
+ 	// The args are the arguments after the command name.
+@@ -77,7 +77,7 @@
+ func (c *Command) Usage() {
+ 	buildCommandText(c)
+ 	fmt.Fprintf(os.Stderr, "usage: %s\n", c.UsageLine)
+-	fmt.Fprintf(os.Stderr, "Run 'xray help %s' for details.\n", c.LongName())
++	fmt.Fprintf(os.Stderr, "Run 'app help %s' for details.\n", c.LongName())
+ 	SetExitStatus(2)
+ 	Exit()
+ }
+diff -ruN xray-core-probe/main/commands/base/env.go xray-core-test/main/commands/base/env.go
+--- xray-core-probe/main/commands/base/env.go	2026-07-11 20:08:42.536226740 +0800
++++ xray-core-test/main/commands/base/env.go	2026-07-11 20:10:30.442722996 +0800
+@@ -19,5 +19,5 @@
+ 		}
+ 		CommandEnv.Exec = path.Base(exec)
+ 	*/
+-	CommandEnv.Exec = "xray"
++	CommandEnv.Exec = "app" // nolog-patch
+ }
+diff -ruN xray-core-probe/main/commands/base/help.go xray-core-test/main/commands/base/help.go
+--- xray-core-probe/main/commands/base/help.go	2026-07-11 20:08:42.536226740 +0800
++++ xray-core-test/main/commands/base/help.go	2026-07-11 20:10:30.442722996 +0800
+@@ -34,7 +34,7 @@
+ 			helpSuccess += " " + strings.Join(args[:i], " ")
+ 		}
+ 		fmt.Fprintf(os.Stderr, "%s help %s: unknown help topic. Run '%s'.\n", CommandEnv.Exec, strings.Join(args, " "), helpSuccess)
+-		SetExitStatus(2) // failed at 'xray help cmd'
++		SetExitStatus(2) // failed at 'app help cmd'
+ 		Exit()
+ 	}
+ 
+@@ -136,7 +136,7 @@
+ 	cmd.UsageLine = buildText(cmd.UsageLine, data)
+ 	// DO NOT SUPPORT ".Short":
+ 	// - It's not necessary
+-	// - Or, we have to build text for all sub commands of current command, like "xray help api"
++	// - Or, we have to build text for all sub commands of current command, like "app help api"
+ 	// cmd.Short = buildText(cmd.Short, data)
+ 	cmd.Long = buildText(cmd.Long, data)
+ }
+diff -ruN xray-core-probe/main/main.go xray-core-test/main/main.go
+--- xray-core-probe/main/main.go	2026-07-11 20:08:42.536226740 +0800
++++ xray-core-test/main/main.go	2026-07-11 20:10:30.442722996 +0800
+@@ -11,7 +11,7 @@
+ func main() {
+ 	os.Args = getArgsV4Compatible()
+ 
+-	base.RootCommand.Long = "Xray is a platform for building proxies."
++	base.RootCommand.Long = "A network proxy platform." // nolog-patch
+ 	base.RootCommand.Commands = append(
+ 		[]*base.Command{
+ 			cmdRun,
+diff -ruN xray-core-probe/main/run.go xray-core-test/main/run.go
+--- xray-core-probe/main/run.go	2026-07-11 20:08:42.536226740 +0800
++++ xray-core-test/main/run.go	2026-07-11 20:10:30.442722996 +0800
+@@ -24,12 +24,12 @@
+ 
+ var cmdRun = &base.Command{
+ 	UsageLine: "{{.Exec}} run [-c config.json] [-confdir dir]",
+-	Short:     "Run Xray with config, the default command",
++	Short:     "Run with config, the default command",
+ 	Long: `
+-Run Xray with config, the default command.
++Run with config, the default command.
+ 
+ The -config=file, -c=file flags set the config files for
+-Xray. Multiple assign is accepted.
++Multiple assign is accepted.
+ 
+ The -confdir=dir flag sets a dir with multiple json config
+ 
+@@ -38,12 +38,12 @@
+ 
+ The config root env object sets process environment variables after all config
+ files are parsed. Variables needed to locate or parse config files must be set
+-in the process environment before Xray starts.
++in the process environment before the process starts.
+ 
+-The -test flag tells Xray to test config files only,
++The -test flag tests config files only,
+ without launching the server.
+ 
+-The -dump flag tells Xray to print the merged config.
++The -dump flag prints the merged config.
+ 	`,
+ }
+ 
+@@ -55,15 +55,15 @@
+ var (
+ 	configFiles cmdarg.Arg // "Config file for Xray.", the option is customed type, parse in main
+ 	configDir   string
+-	dump        = cmdRun.Flag.Bool("dump", false, "Dump merged config only, without launching Xray server.")
+-	test        = cmdRun.Flag.Bool("test", false, "Test config file only, without launching Xray server.")
++	dump        = cmdRun.Flag.Bool("dump", false, "Dump merged config only, without launching the server.")
++	test        = cmdRun.Flag.Bool("test", false, "Test config file only, without launching the server.")
+ 	format      = cmdRun.Flag.String("format", "auto", "Format of input file.")
+ 
+ 	/* We have to do this here because Golang's Test will also need to parse flag, before
+ 	 * main func in this file is run.
+ 	 */
+ 	_ = func() bool {
+-		cmdRun.Flag.Var(&configFiles, "config", "Config path for Xray.")
++		cmdRun.Flag.Var(&configFiles, "config", "Config path.")
+ 		cmdRun.Flag.Var(&configFiles, "c", "Short alias of -config")
+ 		cmdRun.Flag.StringVar(&configDir, "confdir", "", "A dir with multiple json config")
+ 
+@@ -78,7 +78,7 @@
+ 		os.Exit(errCode)
+ 	}
+ 
+-	printVersion()
++	// nolog-patch: silent start
+ 	server, err := startXray()
+ 	if err != nil {
+ 		fmt.Println("Failed to start:", err)
+diff -ruN xray-core-probe/main/version.go xray-core-test/main/version.go
+--- xray-core-probe/main/version.go	2026-07-11 20:08:42.536226740 +0800
++++ xray-core-test/main/version.go	2026-07-11 20:10:30.442722996 +0800
+@@ -9,10 +9,9 @@
+ 
+ var cmdVersion = &base.Command{
+ 	UsageLine: "{{.Exec}} version",
+-	Short:     "Show current version of Xray",
+-	Long: `Version prints the build information for Xray executables.
+-	`,
+-	Run: executeVersion,
++	Short:     "Show current version",
++	Long:      `Show current version.`,
++	Run:       executeVersion,
+ }
+ 
+ func executeVersion(cmd *base.Command, args []string) {
+@@ -20,8 +19,6 @@
+ }
+ 
+ func printVersion() {
+-	version := core.VersionStatement()
+-	for _, s := range version {
+-		fmt.Println(s)
+-	}
++	// nolog-patch: pure version only
++	fmt.Println(core.Version())
+ }

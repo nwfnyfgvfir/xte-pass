@@ -1,0 +1,22 @@
+# Upstream clone / build outputs
+core-src/
+xray-core/
+dist/
+geo/
+bin/
+tmp/
+*.zip
+*.zip.dgst
+app
+app.exe
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local env
+.env
+.venv/
+__pycache__/
