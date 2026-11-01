@@ -104,18 +104,24 @@ if "nolog-patch: swallow all log records" not in s:
         log_go,
     )
 if "nologNoopHandler" not in s:
+    if "logHandler.Store(" in s:
+        # upstream >= v26.4: logHandler is atomic.Pointer[Handler]
+        install = "\tvar h Handler = nologNoopHandler{}\n\tlogHandler.Store(&h)"
+    elif "logHandler.Set(" in s:
+        install = "\tlogHandler.Set(nologNoopHandler{})"
+    else:
+        raise SystemExit("unsupported logHandler API — update patch-nolog.sh")
     s = replace_func(
         s,
         r"^func RegisterHandler\(handler Handler\)\s*\{",
-        """func RegisterHandler(handler Handler) {
-\t// nolog-patch: always install no-op; ignore caller-provided handler
-\tlogHandler.Set(nologNoopHandler{})
-}
-
-type nologNoopHandler struct{}
-
-func (nologNoopHandler) Handle(msg Message) {}
-""",
+        "func RegisterHandler(handler Handler) {\n"
+        "\t// nolog-patch: always install no-op; ignore caller-provided handler\n"
+        f"{install}\n"
+        "}\n"
+        "\n"
+        "type nologNoopHandler struct{}\n"
+        "\n"
+        "func (nologNoopHandler) Handle(msg Message) {}\n",
         log_go,
     )
 log_go.write_text(s)
